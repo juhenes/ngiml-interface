@@ -1,167 +1,248 @@
 from __future__ import annotations
 
-from datetime import datetime
+from collections import OrderedDict
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+import tempfile
+from threading import Lock
+from time import time
 from uuid import uuid4
-import shutil
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import numpy as np
+from PIL import Image
+
+from src import load_model_from_checkpoint
+from src.runtime import run_inference_with_model
 
 BASE_DIR = Path(__file__).resolve().parent
 CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
 STATIC_DIR = BASE_DIR / "static"
 TEMPLATES_DIR = BASE_DIR / "templates"
-WEB_RUNS_DIR = BASE_DIR / "web_runs"
+
+CHECKPOINT_OPTIONS = [
+    ("multi-dataset-full", "Multi Dataset Full", "multi-dataset-full.pt"),
+    ("casia-full", "CASIA Full", "casia-full.pt"),
+    ("casia-effnet-swin", "CASIA Effnet + Swin", "casia-effnet+swin.pt"),
+    ("casia-swin", "CASIA Swin", "casia-swin.pt"),
+    ("casia-effnet", "CASIA Effnet", "casia-effnet.pt"),
+]
+
+PREVIEW_TTL_SECONDS = 300
+MODEL_CACHE_LIMIT = 2
+
+
+@dataclass
+class CachedModel:
+    model: object
+    device: object
+    checkpoint_info: dict
+    checkpoint_path: Path
+
+
+@dataclass
+class PreviewAsset:
+    content: bytes
+    expires_at: float
+
 
 app = FastAPI(title="NGIML Interface", version="1.0.0")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
-WEB_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-app.mount("/results", StaticFiles(directory=str(WEB_RUNS_DIR)), name="results")
+
+_model_cache: OrderedDict[str, CachedModel] = OrderedDict()
+_model_cache_lock = Lock()
+_preview_store: dict[str, PreviewAsset] = {}
+_preview_store_lock = Lock()
 
 
 def list_checkpoints() -> list[dict[str, str]]:
-    checkpoints: list[dict[str, str]] = []
-    if not CHECKPOINTS_DIR.exists():
-        return checkpoints
+    items: list[dict[str, str]] = []
+    for value, label, filename in CHECKPOINT_OPTIONS:
+        checkpoint_path = CHECKPOINTS_DIR / filename
+        if checkpoint_path.exists():
+            items.append(
+                {
+                    "value": value,
+                    "label": label,
+                    "filename": filename,
+                }
+            )
+    return items
 
-    for checkpoint_path in sorted(CHECKPOINTS_DIR.rglob("*.pt")):
-        relative_path = checkpoint_path.relative_to(CHECKPOINTS_DIR).as_posix()
-        checkpoints.append(
-            {
-                "value": relative_path,
-                "label": relative_path,
-            }
-        )
-    return checkpoints
 
-
-def resolve_checkpoint(selection: str) -> Path | None:
-    if not selection:
-        return None
-    checkpoint_path = (CHECKPOINTS_DIR / selection).resolve()
-    try:
-        checkpoint_path.relative_to(CHECKPOINTS_DIR.resolve())
-    except ValueError:
-        return None
-    if checkpoint_path.is_file() and checkpoint_path.suffix == ".pt":
-        return checkpoint_path
+def resolve_checkpoint(selection: str) -> tuple[Path, str] | None:
+    for value, label, filename in CHECKPOINT_OPTIONS:
+        if selection != value:
+            continue
+        checkpoint_path = (CHECKPOINTS_DIR / filename).resolve()
+        if checkpoint_path.exists() and checkpoint_path.is_file():
+            return checkpoint_path, label
     return None
 
 
-def build_run_dir(image_name: str) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe_stem = Path(image_name).stem or "upload"
-    safe_stem = "".join(ch for ch in safe_stem if ch.isalnum() or ch in {"-", "_"}) or "upload"
-    return WEB_RUNS_DIR / f"{timestamp}-{safe_stem}-{uuid4().hex[:8]}"
+def _prune_preview_store() -> None:
+    now = time()
+    expired = [key for key, asset in _preview_store.items() if asset.expires_at <= now]
+    for key in expired:
+        _preview_store.pop(key, None)
 
 
-def get_run_inference():
-    from src import run_inference
-
-    return run_inference
-
-
-def to_results_url(path: str | Path) -> str:
-    relative = Path(path).resolve().relative_to(WEB_RUNS_DIR.resolve())
-    return f"/results/{relative.as_posix()}"
+def _png_bytes_from_array(array: np.ndarray) -> bytes:
+    image = Image.fromarray(array)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
-def render_home(
-    request: Request,
-    *,
-    selected_checkpoint: str | None = None,
-    result: dict | None = None,
-    error: str | None = None,
-) -> HTMLResponse:
+def _rgb_tensor_bytes(image) -> bytes:
+    image_np = (image.detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    return _png_bytes_from_array(image_np)
+
+
+def _single_channel_tensor_bytes(image) -> bytes:
+    image_np = (image.detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+    return _png_bytes_from_array(image_np)
+
+
+def _overlay_bytes(image: np.ndarray) -> bytes:
+    overlay_np = (np.clip(image, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return _png_bytes_from_array(overlay_np)
+
+
+def _store_preview_bytes(content: bytes) -> str:
+    preview_id = uuid4().hex
+    with _preview_store_lock:
+        _prune_preview_store()
+        _preview_store[preview_id] = PreviewAsset(
+            content=content,
+            expires_at=time() + PREVIEW_TTL_SECONDS,
+        )
+    return preview_id
+
+
+def _get_or_load_model(cache_key: str, checkpoint_path: Path) -> CachedModel:
+    with _model_cache_lock:
+        cached = _model_cache.get(cache_key)
+        if cached is not None:
+            _model_cache.move_to_end(cache_key)
+            return cached
+
+    model, device, checkpoint_info = load_model_from_checkpoint(checkpoint_path)
+    cached_model = CachedModel(
+        model=model,
+        device=device,
+        checkpoint_info=checkpoint_info,
+        checkpoint_path=checkpoint_path,
+    )
+
+    with _model_cache_lock:
+        existing = _model_cache.get(cache_key)
+        if existing is not None:
+            _model_cache.move_to_end(cache_key)
+            return existing
+        _model_cache[cache_key] = cached_model
+        while len(_model_cache) > MODEL_CACHE_LIMIT:
+            _model_cache.popitem(last=False)
+    return cached_model
+
+
+def _run_prediction_from_bytes(selection: str, image_bytes: bytes, suffix: str) -> dict:
+    resolved = resolve_checkpoint(selection)
+    if resolved is None:
+        raise ValueError("Please choose a valid checkpoint.")
+    checkpoint_path, checkpoint_label = resolved
+    cached = _get_or_load_model(selection, checkpoint_path)
+
+    with tempfile.TemporaryDirectory(prefix="ngiml-web-") as temp_dir:
+        image_path = Path(temp_dir) / f"input{suffix}"
+        image_path.write_bytes(image_bytes)
+        prediction = run_inference_with_model(
+            cached.model,
+            cached.device,
+            cached.checkpoint_info,
+            checkpoint_path=cached.checkpoint_path,
+            image_path=image_path,
+            output_dir=None,
+        )
+
+    return {
+        "checkpoint_label": checkpoint_label,
+        "input_bytes": _rgb_tensor_bytes(prediction["working_image"]),
+        "probability_bytes": _single_channel_tensor_bytes(prediction["preview_probability"]),
+        "binary_bytes": _single_channel_tensor_bytes(prediction["preview_binary"]),
+        "overlay_bytes": _overlay_bytes(prediction["preview_overlay"]),
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request) -> HTMLResponse:
     checkpoints = list_checkpoints()
-    if selected_checkpoint is None and checkpoints:
-        selected_checkpoint = checkpoints[0]["value"]
-
+    selected_checkpoint = checkpoints[0]["value"] if checkpoints else None
     return templates.TemplateResponse(
         name="index.html",
         request=request,
         context={
             "checkpoints": checkpoints,
             "selected_checkpoint": selected_checkpoint,
-            "result": result,
-            "error": error,
         },
     )
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> HTMLResponse:
-    return render_home(request)
+@app.get("/preview/{preview_id}")
+async def preview(preview_id: str) -> Response:
+    with _preview_store_lock:
+        _prune_preview_store()
+        asset = _preview_store.get(preview_id)
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Preview expired.")
+    return Response(content=asset.content, media_type="image/png")
 
 
-@app.post("/predict", response_class=HTMLResponse)
+@app.post("/predict")
 async def predict(
-    request: Request,
     checkpoint: str = Form(...),
     image: UploadFile = File(...),
-) -> HTMLResponse:
-    checkpoint_path = resolve_checkpoint(checkpoint)
-    if checkpoint_path is None:
-        return render_home(request, selected_checkpoint=checkpoint, error="Please choose a valid checkpoint.")
-
+) -> JSONResponse:
     if not image.filename:
-        return render_home(request, selected_checkpoint=checkpoint, error="Please upload an image.")
+        return JSONResponse({"ok": False, "error": "Please upload an image."}, status_code=400)
 
     suffix = Path(image.filename).suffix.lower()
     if suffix not in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}:
-        return render_home(
-            request,
-            selected_checkpoint=checkpoint,
-            error="Unsupported image type. Use PNG, JPG, JPEG, BMP, TIF, TIFF, or WEBP.",
+        return JSONResponse(
+            {"ok": False, "error": "Unsupported image type. Use PNG, JPG, JPEG, BMP, TIF, TIFF, or WEBP."},
+            status_code=400,
         )
-
-    run_dir = build_run_dir(image.filename)
-    upload_dir = run_dir / "uploads"
-    output_dir = run_dir / "outputs"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    image_path = upload_dir / f"input{suffix}"
-    with image_path.open("wb") as buffer:
-        shutil.copyfileobj(image.file, buffer)
 
     try:
-        run_inference = get_run_inference()
-        prediction = run_inference(
-            checkpoint_path=checkpoint_path,
-            image_path=image_path,
-            output_dir=output_dir,
-        )
+        image_bytes = await image.read()
+        payload = await run_in_threadpool(_run_prediction_from_bytes, checkpoint, image_bytes, suffix)
+        input_id = await run_in_threadpool(_store_preview_bytes, payload["input_bytes"])
+        probability_id = await run_in_threadpool(_store_preview_bytes, payload["probability_bytes"])
+        binary_id = await run_in_threadpool(_store_preview_bytes, payload["binary_bytes"])
+        overlay_id = await run_in_threadpool(_store_preview_bytes, payload["overlay_bytes"])
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     except Exception as exc:
-        return render_home(
-            request,
-            selected_checkpoint=checkpoint,
-            error=f"Inference failed: {exc}",
-        )
+        return JSONResponse({"ok": False, "error": f"Inference failed: {exc}"}, status_code=500)
     finally:
         await image.close()
 
-    saved_paths = prediction.get("saved_paths") or {}
-    result = {
-        "checkpoint": checkpoint_path.relative_to(CHECKPOINTS_DIR).as_posix(),
-        "threshold": f"{prediction['threshold']:.4f}",
-        "device": prediction["device"],
-        "normalization_mode": prediction["normalization_mode"],
-        "probability_mean": f"{float(prediction['probability'].mean().item()):.4f}",
-        "probability_max": f"{float(prediction['probability'].max().item()):.4f}",
-        "predicted_positive_ratio": f"{float(prediction['binary'].mean().item()):.4f}",
-        "input_url": to_results_url(saved_paths["image_path"]),
-        "probability_url": to_results_url(saved_paths["probability_path"]),
-        "binary_url": to_results_url(saved_paths["binary_path"]),
-        "overlay_url": to_results_url(saved_paths["overlay_path"]),
-        "metadata_url": to_results_url(saved_paths["metadata_path"]),
-        "output_dir": str(output_dir.resolve()),
-    }
-    return render_home(request, selected_checkpoint=checkpoint, result=result)
+    return JSONResponse(
+        {
+            "ok": True,
+            "checkpointLabel": payload["checkpoint_label"],
+            "previews": {
+                "input": f"/preview/{input_id}",
+                "prediction": f"/preview/{probability_id}",
+                "binary": f"/preview/{binary_id}",
+                "overlay": f"/preview/{overlay_id}",
+            },
+        }
+    )

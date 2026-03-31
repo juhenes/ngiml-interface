@@ -40,14 +40,17 @@ py -3.13 -m venv .venv313
 - Lets the user choose a checkpoint from a dropdown
 - Lets the user upload an image
 - Runs inference using the existing runtime in `src/`
-- Shows the input image, probability map, binary mask, and overlay
-- Saves each run under `web_runs/<timestamp>-<image>-<id>/outputs/`
+- Uses `resize_keep_aspect_center_crop` preprocessing by default before inference
+- Shows the cropped inference preview for the input image, probability map, binary mask, and overlay
+- Does not persist uploads or generated results after processing finishes
 
 ## Developer notes
 
 - Main FastAPI entrypoint: `app.py`
 - HTML template: `templates/index.html`
 - Styles: `static/styles.css`
-- Result files are served from `web_runs/`
 - Existing CLI inference via `predict.py` still works
 - `setup_windows.ps1` and `run_web.ps1` are the recommended workflow on Windows
+- The default crop size comes from checkpoint metadata `input_size` when available, otherwise `448`
+- The preprocessing flow resizes while keeping aspect ratio, then center-crops to the target size
+- The web page includes a loading overlay during inference so long-running requests feel responsive

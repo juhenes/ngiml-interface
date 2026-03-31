@@ -518,62 +518,62 @@ def predict_probability_map(
     return probability
 
 
-def run_inference(
-    checkpoint_path: str | Path,
-    image_path: str | Path,
-    *,
-    output_dir: str | Path | None = None,
-    threshold: float | None = None,
-    normalization_mode: str | None = None,
-    resize_max_side: int | None = None,
-    device: str | torch.device | None = None,
-) -> dict[str, Any]:
-    resolved_device = torch.device(device) if device is not None else None
-    model, runtime_device, checkpoint_info = load_model_from_checkpoint(checkpoint_path, device=resolved_device)
+def resolve_center_crop_size(
+    checkpoint_info: dict[str, Any] | None,
+    crop_size: int | None = None,
+) -> int:
+    default_crop_size = 448
+    if isinstance(checkpoint_info, dict):
+        default_crop_size = int(checkpoint_info.get("input_size") or default_crop_size)
+    return max(32, int(crop_size or default_crop_size))
 
-    original_image = load_rgb_image(image_path)
-    working_image, original_hw = resize_image_for_inference(
-        original_image,
-        resize_max_side=resize_max_side if resize_max_side is not None else checkpoint_info.get("resize_max_side", 0),
-    )
-    resolved_normalization = resolve_normalization_mode_for_inference(
-        manual_mode=normalization_mode,
-        checkpoint_train_config=checkpoint_info.get("train_config"),
-        default_mode="imagenet",
-    )
-    resolved_threshold = float(
-        checkpoint_info["default_threshold"] if threshold is None else threshold
-    )
 
-    probability = predict_probability_map(
-        model,
-        working_image,
-        runtime_device,
-        normalization_mode=resolved_normalization,
-    ).clamp(0.0, 1.0)
-    probability = _resize_probability_to_original(probability, original_hw)
-    binary = (probability >= resolved_threshold).float()
-    overlay = overlay_prediction_on_image(original_image, probability)
+def resize_keep_aspect_center_crop(
+    image: torch.Tensor,
+    crop_size: int,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    h, w = int(image.shape[-2]), int(image.shape[-1])
+    target = max(1, int(crop_size))
+    scale = max(float(target) / float(max(h, 1)), float(target) / float(max(w, 1)))
+    resized_h = max(target, int(round(h * scale)))
+    resized_w = max(target, int(round(w * scale)))
 
-    result = {
-        "checkpoint_path": str(Path(checkpoint_path).resolve()),
-        "image_path": str(Path(image_path).resolve()),
-        "device": str(runtime_device),
-        "threshold": resolved_threshold,
-        "normalization_mode": resolved_normalization,
-        "original_image": original_image,
-        "working_image": working_image,
-        "probability": probability,
-        "binary": binary,
-        "overlay": overlay,
-        "checkpoint_info": checkpoint_info,
-        "output_dir": str(Path(output_dir).resolve()) if output_dir is not None else None,
-        "saved_paths": None,
+    resized = F.interpolate(
+        image.unsqueeze(0),
+        size=(resized_h, resized_w),
+        mode="bilinear",
+        align_corners=False,
+    )[0]
+
+    top = max(0, (resized_h - target) // 2)
+    left = max(0, (resized_w - target) // 2)
+    cropped = resized[:, top : top + target, left : left + target]
+    metadata = {
+        "original_height": h,
+        "original_width": w,
+        "resized_height": resized_h,
+        "resized_width": resized_w,
+        "crop_top": top,
+        "crop_left": left,
+        "crop_size": target,
     }
+    return cropped.contiguous(), metadata
 
-    if output_dir is not None:
-        result["saved_paths"] = save_result(result, output_dir)
-    return result
+
+def restore_probability_from_center_crop(
+    probability: torch.Tensor,
+    transform: dict[str, int],
+) -> torch.Tensor:
+    resized_h = int(transform["resized_height"])
+    resized_w = int(transform["resized_width"])
+    top = int(transform["crop_top"])
+    left = int(transform["crop_left"])
+    original_h = int(transform["original_height"])
+    original_w = int(transform["original_width"])
+
+    canvas = torch.zeros((resized_h, resized_w), dtype=probability.dtype)
+    canvas[top : top + probability.shape[-2], left : left + probability.shape[-1]] = probability
+    return _resize_probability_to_original(canvas, (original_h, original_w))
 
 
 def overlay_prediction_on_image(image: torch.Tensor, probability: torch.Tensor) -> np.ndarray:
@@ -584,6 +584,159 @@ def overlay_prediction_on_image(image: torch.Tensor, probability: torch.Tensor) 
     return np.clip(image_np * (1.0 - alpha) + red * alpha, 0.0, 1.0)
 
 
+def run_inference(
+    checkpoint_path: str | Path,
+    image_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    threshold: float | None = None,
+    normalization_mode: str | None = None,
+    resize_max_side: int | None = None,
+    crop_size: int | None = None,
+    device: str | torch.device | None = None,
+) -> dict[str, Any]:
+    resolved_device = torch.device(device) if device is not None else None
+    model, runtime_device, checkpoint_info = load_model_from_checkpoint(checkpoint_path, device=resolved_device)
+
+    original_image = load_rgb_image(image_path)
+    if resize_max_side is not None:
+        working_image, _ = resize_image_for_inference(
+            original_image,
+            resize_max_side=resize_max_side,
+        )
+    else:
+        working_image = original_image
+    resolved_normalization = resolve_normalization_mode_for_inference(
+        manual_mode=normalization_mode,
+        checkpoint_train_config=checkpoint_info.get("train_config"),
+        default_mode="imagenet",
+    )
+    resolved_threshold = float(
+        checkpoint_info["default_threshold"] if threshold is None else threshold
+    )
+    resolved_crop_size = resolve_center_crop_size(
+        checkpoint_info,
+        crop_size=crop_size,
+    )
+    prepared_image, crop_transform = resize_keep_aspect_center_crop(
+        working_image,
+        crop_size=resolved_crop_size,
+    )
+
+    probability = predict_probability_map(
+        model,
+        prepared_image,
+        runtime_device,
+        normalization_mode=resolved_normalization,
+    ).clamp(0.0, 1.0)
+    preview_probability = probability.clone()
+    preview_binary = (preview_probability >= resolved_threshold).float()
+    preview_overlay = overlay_prediction_on_image(prepared_image, preview_probability)
+    probability = restore_probability_from_center_crop(probability, crop_transform)
+    binary = (probability >= resolved_threshold).float()
+    overlay = overlay_prediction_on_image(original_image, probability)
+
+    result = {
+        "checkpoint_path": str(Path(checkpoint_path).resolve()),
+        "image_path": str(Path(image_path).resolve()),
+        "device": str(runtime_device),
+        "threshold": resolved_threshold,
+        "normalization_mode": resolved_normalization,
+        "original_image": original_image,
+        "working_image": prepared_image,
+        "preview_probability": preview_probability,
+        "preview_binary": preview_binary,
+        "preview_overlay": preview_overlay,
+        "probability": probability,
+        "binary": binary,
+        "overlay": overlay,
+        "checkpoint_info": checkpoint_info,
+        "inference_mode": "resize_keep_aspect_center_crop",
+        "crop_size": resolved_crop_size,
+        "output_dir": str(Path(output_dir).resolve()) if output_dir is not None else None,
+        "saved_paths": None,
+    }
+
+    if output_dir is not None:
+        result["saved_paths"] = save_result(result, output_dir)
+    return result
+
+
+def run_inference_with_model(
+    model: HybridNGIML,
+    runtime_device: torch.device,
+    checkpoint_info: dict[str, Any],
+    *,
+    checkpoint_path: str | Path,
+    image_path: str | Path,
+    output_dir: str | Path | None = None,
+    threshold: float | None = None,
+    normalization_mode: str | None = None,
+    resize_max_side: int | None = None,
+    crop_size: int | None = None,
+) -> dict[str, Any]:
+    original_image = load_rgb_image(image_path)
+    if resize_max_side is not None:
+        working_image, _ = resize_image_for_inference(
+            original_image,
+            resize_max_side=resize_max_side,
+        )
+    else:
+        working_image = original_image
+    resolved_normalization = resolve_normalization_mode_for_inference(
+        manual_mode=normalization_mode,
+        checkpoint_train_config=checkpoint_info.get("train_config"),
+        default_mode="imagenet",
+    )
+    resolved_threshold = float(
+        checkpoint_info["default_threshold"] if threshold is None else threshold
+    )
+    resolved_crop_size = resolve_center_crop_size(
+        checkpoint_info,
+        crop_size=crop_size,
+    )
+    prepared_image, crop_transform = resize_keep_aspect_center_crop(
+        working_image,
+        crop_size=resolved_crop_size,
+    )
+
+    probability = predict_probability_map(
+        model,
+        prepared_image,
+        runtime_device,
+        normalization_mode=resolved_normalization,
+    ).clamp(0.0, 1.0)
+    preview_probability = probability.clone()
+    preview_binary = (preview_probability >= resolved_threshold).float()
+    preview_overlay = overlay_prediction_on_image(prepared_image, preview_probability)
+    probability = restore_probability_from_center_crop(probability, crop_transform)
+    binary = (probability >= resolved_threshold).float()
+    overlay = overlay_prediction_on_image(original_image, probability)
+
+    result = {
+        "checkpoint_path": str(Path(checkpoint_path).resolve()),
+        "image_path": str(Path(image_path).resolve()),
+        "device": str(runtime_device),
+        "threshold": resolved_threshold,
+        "normalization_mode": resolved_normalization,
+        "original_image": original_image,
+        "working_image": prepared_image,
+        "preview_probability": preview_probability,
+        "preview_binary": preview_binary,
+        "preview_overlay": preview_overlay,
+        "probability": probability,
+        "binary": binary,
+        "overlay": overlay,
+        "checkpoint_info": checkpoint_info,
+        "inference_mode": "resize_keep_aspect_center_crop",
+        "crop_size": resolved_crop_size,
+        "output_dir": str(Path(output_dir).resolve()) if output_dir is not None else None,
+        "saved_paths": None,
+    }
+
+    if output_dir is not None:
+        result["saved_paths"] = save_result(result, output_dir)
+    return result
 def plot_result(result: dict[str, Any]) -> tuple[Any, Any]:
     plt = _require_matplotlib()
     image_np = result["original_image"].detach().cpu().permute(1, 2, 0).numpy()
@@ -622,17 +775,29 @@ def save_result(result: dict[str, Any], output_dir: str | Path) -> dict[str, str
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image_np = (result["original_image"].detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    preview_image_np = (result["working_image"].detach().cpu().clamp(0.0, 1.0).permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    preview_prob_np = (result["preview_probability"].detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+    preview_bin_np = (result["preview_binary"].detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+    preview_overlay_np = (np.clip(result["preview_overlay"], 0.0, 1.0) * 255.0).astype(np.uint8)
     prob_np = (result["probability"].detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
     bin_np = (result["binary"].detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
     overlay_np = (np.clip(result["overlay"], 0.0, 1.0) * 255.0).astype(np.uint8)
 
     image_path = output_dir / "input_rgb.png"
+    preview_image_path = output_dir / "preview_input_rgb.png"
+    preview_probability_path = output_dir / "preview_probability_map.png"
+    preview_binary_path = output_dir / "preview_binary_mask.png"
+    preview_overlay_path = output_dir / "preview_overlay.png"
     probability_path = output_dir / "probability_map.png"
     binary_path = output_dir / "binary_mask.png"
     overlay_path = output_dir / "overlay.png"
     metadata_path = output_dir / "prediction.json"
 
     _save_image(image_path, image_np)
+    _save_image(preview_image_path, preview_image_np)
+    _save_image(preview_probability_path, preview_prob_np)
+    _save_image(preview_binary_path, preview_bin_np)
+    _save_image(preview_overlay_path, preview_overlay_np)
     _save_image(probability_path, prob_np)
     _save_image(binary_path, bin_np)
     _save_image(overlay_path, overlay_np)
@@ -643,6 +808,8 @@ def save_result(result: dict[str, Any], output_dir: str | Path) -> dict[str, str
         "device": result["device"],
         "threshold": result["threshold"],
         "normalization_mode": result["normalization_mode"],
+        "inference_mode": result.get("inference_mode", "single_pass"),
+        "crop_size": result.get("crop_size"),
         "probability_mean": float(result["probability"].mean().item()),
         "probability_max": float(result["probability"].max().item()),
         "predicted_positive_ratio": float(result["binary"].mean().item()),
@@ -656,6 +823,10 @@ def save_result(result: dict[str, Any], output_dir: str | Path) -> dict[str, str
 
     return {
         "image_path": str(image_path.resolve()),
+        "preview_image_path": str(preview_image_path.resolve()),
+        "preview_probability_path": str(preview_probability_path.resolve()),
+        "preview_binary_path": str(preview_binary_path.resolve()),
+        "preview_overlay_path": str(preview_overlay_path.resolve()),
         "probability_path": str(probability_path.resolve()),
         "binary_path": str(binary_path.resolve()),
         "overlay_path": str(overlay_path.resolve()),

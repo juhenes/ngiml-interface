@@ -42,7 +42,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resize-max-side",
         type=int,
         default=None,
-        help="Resize cap for the shorter image side. Defaults to checkpoint metadata when available.",
+        help="Optional resize cap for the shorter image side before center-crop preprocessing.",
+    )
+    parser.add_argument(
+        "--crop-size",
+        type=int,
+        default=None,
+        help="Resize-keep-aspect center-crop size. Defaults to the checkpoint input size or 448.",
     )
     parser.add_argument(
         "--device",
@@ -79,6 +85,7 @@ def main() -> int:
         threshold=args.threshold,
         normalization_mode=args.normalization_mode,
         resize_max_side=args.resize_max_side,
+        crop_size=args.crop_size,
         device=args.device,
     )
 
@@ -88,6 +95,8 @@ def main() -> int:
         "device": result["device"],
         "threshold": result["threshold"],
         "normalization_mode": result["normalization_mode"],
+        "inference_mode": result["inference_mode"],
+        "crop_size": result["crop_size"],
         "probability_mean": float(result["probability"].mean().item()),
         "probability_max": float(result["probability"].max().item()),
         "predicted_positive_ratio": float(result["binary"].mean().item()),
