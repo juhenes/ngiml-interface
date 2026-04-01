@@ -26,6 +26,16 @@ from .model.unet_decoder import UNetDecoderConfig
 
 _LOG = logging.getLogger(__name__)
 
+DEFAULT_HF_REPO_ID = "juhenes/ngiml"
+AVAILABLE_HF_CHECKPOINTS = (
+    "casia-effnet.pt",
+    "casia-effnet+noise.pt",
+    "casia-effnet+swin.pt",
+    "casia-full.pt",
+    "casia-swin.pt",
+    "casia-swin+noise.pt",
+)
+
 def _require_matplotlib():
     try:
         import matplotlib.pyplot as plt
@@ -414,6 +424,43 @@ def load_model_from_checkpoint(
     return model, device, info
 
 
+def resolve_huggingface_checkpoint_filename(checkpoint_name: str) -> str:
+    normalized = str(checkpoint_name).strip()
+    if not normalized:
+        raise ValueError("checkpoint_name must be a non-empty string")
+    if normalized.endswith(".pt"):
+        return normalized
+    return f"{normalized}.pt"
+
+
+def download_checkpoint_from_huggingface(
+    checkpoint_name: str,
+    *,
+    repo_id: str = DEFAULT_HF_REPO_ID,
+    cache_dir: str | Path | None = None,
+) -> Path:
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception as exc:
+        raise ImportError(
+            "huggingface_hub is required for downloading checkpoints. Install it with pip install huggingface_hub."
+        ) from exc
+
+    filename = resolve_huggingface_checkpoint_filename(checkpoint_name)
+    if filename not in AVAILABLE_HF_CHECKPOINTS:
+        available = ", ".join(AVAILABLE_HF_CHECKPOINTS)
+        raise ValueError(f"Unsupported checkpoint {filename!r}. Expected one of: {available}")
+
+    target_dir = Path(cache_dir) if cache_dir is not None else Path.cwd() / "checkpoints_cache"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        local_dir=str(target_dir),
+    )
+    return Path(downloaded).resolve()
+
+
 def load_rgb_image(image_path: str | Path) -> torch.Tensor:
     image = Image.open(image_path).convert("RGB")
     image_np = np.asarray(image, dtype=np.float32) / 255.0
@@ -660,6 +707,36 @@ def run_inference(
     if output_dir is not None:
         result["saved_paths"] = save_result(result, output_dir)
     return result
+
+
+def run_huggingface_inference(
+    checkpoint_name: str,
+    image_path: str | Path,
+    *,
+    output_dir: str | Path | None = None,
+    threshold: float | None = None,
+    normalization_mode: str | None = None,
+    resize_max_side: int | None = None,
+    crop_size: int | None = None,
+    device: str | torch.device | None = None,
+    repo_id: str = DEFAULT_HF_REPO_ID,
+    cache_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = download_checkpoint_from_huggingface(
+        checkpoint_name,
+        repo_id=repo_id,
+        cache_dir=cache_dir,
+    )
+    return run_inference(
+        checkpoint_path=checkpoint_path,
+        image_path=image_path,
+        output_dir=output_dir,
+        threshold=threshold,
+        normalization_mode=normalization_mode,
+        resize_max_side=resize_max_side,
+        crop_size=crop_size,
+        device=device,
+    )
 
 
 def run_inference_with_model(
