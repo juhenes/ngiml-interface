@@ -1,6 +1,6 @@
 # NGIML
 
-**NGIML (Noise-Guided Image Manipulation Localization)** is a deep learning framework for **single-image forgery localization**. It predicts manipulated regions at the pixel level using a hybrid architecture built from **EfficientNet**, **Swin Transformer**, and **U-Net**, with **noise-guided features** to help surface subtle tampering artifacts.
+**NGIML (Noise-Guided Image Manipulation Localization)** is a deep learning framework for **forgery localization**. It predicts manipulated regions at the pixel level using a hybrid architecture built from **EfficientNet**, **Swin Transformer**, and **U-Net**, with **noise-guided features** to help surface subtle tampering artifacts.
 
 This repository contains the model implementation and inference runtime for local use, plus a notebook workflow for running inference with pretrained checkpoints from Hugging Face.
 
@@ -10,7 +10,7 @@ This project is part of a **Bachelor's Thesis in Computer Science** from **Batan
 
 ## Overview
 
-NGIML is designed to localize image forgeries that may be visually subtle or difficult to detect with standard semantic features alone.
+NGIML is designed to localize image forgeries
 
 Core ideas:
 
