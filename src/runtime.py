@@ -607,6 +607,90 @@ def resize_keep_aspect_center_crop(
     return cropped.contiguous(), metadata
 
 
+def symmetric_pad_to_size(
+    image: torch.Tensor,
+    target_size: int,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    h, w = int(image.shape[-2]), int(image.shape[-1])
+    target = max(1, int(target_size))
+    pad_h = max(0, target - h)
+    pad_w = max(0, target - w)
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    padded = F.pad(
+        image,
+        (pad_left, pad_right, pad_top, pad_bottom),
+        mode="constant",
+        value=0.0,
+    )
+    metadata = {
+        "original_height": h,
+        "original_width": w,
+        "pad_top": pad_top,
+        "pad_bottom": pad_bottom,
+        "pad_left": pad_left,
+        "pad_right": pad_right,
+        "crop_size": target,
+    }
+    return padded.contiguous(), metadata
+
+
+def remove_symmetric_padding(
+    probability: torch.Tensor,
+    transform: dict[str, int],
+) -> torch.Tensor:
+    pad_top = int(transform.get("pad_top", 0))
+    pad_bottom = int(transform.get("pad_bottom", 0))
+    pad_left = int(transform.get("pad_left", 0))
+    pad_right = int(transform.get("pad_right", 0))
+
+    bottom_index = probability.shape[-2] - pad_bottom if pad_bottom > 0 else probability.shape[-2]
+    right_index = probability.shape[-1] - pad_right if pad_right > 0 else probability.shape[-1]
+    return probability[pad_top:bottom_index, pad_left:right_index].contiguous()
+
+
+def prepare_image_for_inference_mode(
+    image: torch.Tensor,
+    crop_size: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    h, w = int(image.shape[-2]), int(image.shape[-1])
+    target = max(1, int(crop_size))
+
+    if h < target or w < target:
+        padded, pad_transform = symmetric_pad_to_size(image, target)
+        return padded, {
+            "mode": "symmetric_pad",
+            "target": target,
+            **pad_transform,
+        }
+
+    cropped, crop_transform = resize_keep_aspect_center_crop(image, target)
+    keep_cropped_output = (h != w) and (h > target or w > target)
+    return cropped, {
+        "mode": "center_crop",
+        "target": target,
+        "keep_cropped_output": keep_cropped_output,
+        **crop_transform,
+    }
+
+
+def finalize_probability_for_inference_mode(
+    probability: torch.Tensor,
+    transform: dict[str, Any],
+) -> tuple[torch.Tensor, str]:
+    mode = str(transform.get("mode") or "center_crop")
+    if mode == "symmetric_pad":
+        return remove_symmetric_padding(probability, transform), "symmetric_pad"
+
+    if bool(transform.get("keep_cropped_output")):
+        return probability.contiguous(), "center_crop_keep"
+
+    return restore_probability_from_center_crop(probability, transform), "center_crop_restore"
+
+
 def restore_probability_from_center_crop(
     probability: torch.Tensor,
     transform: dict[str, int],
@@ -665,7 +749,7 @@ def run_inference(
         checkpoint_info,
         crop_size=crop_size,
     )
-    prepared_image, crop_transform = resize_keep_aspect_center_crop(
+    prepared_image, mode_transform = prepare_image_for_inference_mode(
         working_image,
         crop_size=resolved_crop_size,
     )
@@ -676,12 +760,20 @@ def run_inference(
         runtime_device,
         normalization_mode=resolved_normalization,
     ).clamp(0.0, 1.0)
+    probability, inference_mode = finalize_probability_for_inference_mode(
+        probability,
+        mode_transform,
+    )
+    if inference_mode == "center_crop_keep":
+        output_image = prepared_image
+    else:
+        output_image = working_image
+
     preview_probability = probability.clone()
     preview_binary = (preview_probability >= resolved_threshold).float()
-    preview_overlay = overlay_prediction_on_image(prepared_image, preview_probability)
-    probability = restore_probability_from_center_crop(probability, crop_transform)
+    preview_overlay = overlay_prediction_on_image(output_image, preview_probability)
     binary = (probability >= resolved_threshold).float()
-    overlay = overlay_prediction_on_image(original_image, probability)
+    overlay = overlay_prediction_on_image(output_image, probability)
 
     result = {
         "checkpoint_path": str(Path(checkpoint_path).resolve()),
@@ -690,7 +782,7 @@ def run_inference(
         "threshold": resolved_threshold,
         "normalization_mode": resolved_normalization,
         "original_image": original_image,
-        "working_image": prepared_image,
+        "working_image": output_image,
         "preview_probability": preview_probability,
         "preview_binary": preview_binary,
         "preview_overlay": preview_overlay,
@@ -698,7 +790,7 @@ def run_inference(
         "binary": binary,
         "overlay": overlay,
         "checkpoint_info": checkpoint_info,
-        "inference_mode": "resize_keep_aspect_center_crop",
+        "inference_mode": inference_mode,
         "crop_size": resolved_crop_size,
         "output_dir": str(Path(output_dir).resolve()) if output_dir is not None else None,
         "saved_paths": None,
@@ -772,7 +864,7 @@ def run_inference_with_model(
         checkpoint_info,
         crop_size=crop_size,
     )
-    prepared_image, crop_transform = resize_keep_aspect_center_crop(
+    prepared_image, mode_transform = prepare_image_for_inference_mode(
         working_image,
         crop_size=resolved_crop_size,
     )
@@ -783,12 +875,20 @@ def run_inference_with_model(
         runtime_device,
         normalization_mode=resolved_normalization,
     ).clamp(0.0, 1.0)
+    probability, inference_mode = finalize_probability_for_inference_mode(
+        probability,
+        mode_transform,
+    )
+    if inference_mode == "center_crop_keep":
+        output_image = prepared_image
+    else:
+        output_image = working_image
+
     preview_probability = probability.clone()
     preview_binary = (preview_probability >= resolved_threshold).float()
-    preview_overlay = overlay_prediction_on_image(prepared_image, preview_probability)
-    probability = restore_probability_from_center_crop(probability, crop_transform)
+    preview_overlay = overlay_prediction_on_image(output_image, preview_probability)
     binary = (probability >= resolved_threshold).float()
-    overlay = overlay_prediction_on_image(original_image, probability)
+    overlay = overlay_prediction_on_image(output_image, probability)
 
     result = {
         "checkpoint_path": str(Path(checkpoint_path).resolve()),
@@ -797,7 +897,7 @@ def run_inference_with_model(
         "threshold": resolved_threshold,
         "normalization_mode": resolved_normalization,
         "original_image": original_image,
-        "working_image": prepared_image,
+        "working_image": output_image,
         "preview_probability": preview_probability,
         "preview_binary": preview_binary,
         "preview_overlay": preview_overlay,
@@ -805,7 +905,7 @@ def run_inference_with_model(
         "binary": binary,
         "overlay": overlay,
         "checkpoint_info": checkpoint_info,
-        "inference_mode": "resize_keep_aspect_center_crop",
+        "inference_mode": inference_mode,
         "crop_size": resolved_crop_size,
         "output_dir": str(Path(output_dir).resolve()) if output_dir is not None else None,
         "saved_paths": None,
