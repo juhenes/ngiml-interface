@@ -916,7 +916,7 @@ def run_inference_with_model(
     return result
 def plot_result(result: dict[str, Any]) -> tuple[Any, Any]:
     plt = _require_matplotlib()
-    image_np = result["original_image"].detach().cpu().permute(1, 2, 0).numpy()
+    image_np = result["working_image"].detach().cpu().permute(1, 2, 0).numpy()
     prob_np = result["probability"].detach().cpu().numpy()
     bin_np = result["binary"].detach().cpu().numpy()
     overlay_np = result["overlay"]
