@@ -1,4 +1,8 @@
 __pycache__/
 *.pyc
 .venv/*
+checkpoints/*
+.tmp-py313/*
+.tmp-py/*
 .venv-manim/*
+media/*
