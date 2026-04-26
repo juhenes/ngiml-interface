@@ -28,12 +28,17 @@ _LOG = logging.getLogger(__name__)
 
 DEFAULT_HF_REPO_ID = "juhenes/ngiml"
 AVAILABLE_HF_CHECKPOINTS = (
-    "casia-effnet.pt",
-    "casia-effnet+noise.pt",
-    "casia-effnet+swin.pt",
-    "casia-full.pt",
-    "casia-swin.pt",
-    "casia-swin+noise.pt",
+    "CASIA2-EffNet+Noise-42.pt",
+    "CASIA2-EffNet+Swin-42.pt",
+    "CASIA2-EffNet-42.pt",
+    "CASIA2-Full(mbconv)-42.pt",
+    "CASIA2-Full-4.pt",
+    "CASIA2-Full-42.pt",
+    "CASIA2-Full-420.pt",
+    "CASIA2-Swin+Noise-42.pt",
+    "CASIA2-Swin-42.pt",
+    "CCC-Full-42.pt",
+    "TampCOCO-Full-42.pt",
 )
 
 def _require_matplotlib():

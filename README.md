@@ -19,10 +19,6 @@ Core ideas:
 - **Pixel-level decoding** with a U-Net-style decoder for dense localization output
 - **Single-image inference** that produces probability maps, binary masks, and overlays
 
-## Training Note
-
-All pretrained models in this repository were trained **exclusively on [`CASIA v2`](https://github.com/namtpham/casia2groundtruth)**. Performance on other datasets or real-world images may vary and may require additional fine-tuning.
-
 ---
 
 ## Architecture
@@ -62,12 +58,17 @@ Pretrained checkpoints are hosted on Hugging Face:
 
 Available checkpoints:
 
-- `casia-effnet.pt`
-- `casia-effnet+noise.pt`
-- `casia-effnet+swin.pt`
-- `casia-full.pt`
-- `casia-swin.pt`
-- `casia-swin+noise.pt`
+- `CASIA2-EffNet+Noise-42.pt`
+- `CASIA2-EffNet+Swin-42.pt`
+- `CASIA2-EffNet-42.pt`
+- `CASIA2-Full(mbconv)-42.pt`
+- `CASIA2-Full-4.pt`
+- `CASIA2-Full-42.pt`
+- `CASIA2-Full-420.pt`
+- `CASIA2-Swin+Noise-42.pt`
+- `CASIA2-Swin-42.pt`
+- `CCC-Full-42.pt`
+- `TampCOCO-Full-42.pt`
 
 Each file corresponds to a different model configuration.
 
@@ -88,7 +89,7 @@ python predict.py --checkpoint /path/to/checkpoint.pt --image /path/to/image.png
 Example using a checkpoint downloaded from Hugging Face:
 
 ```bash
-python predict.py --checkpoint checkpoints_cache/casia-full.pt --image /path/to/image.png
+python predict.py --checkpoint checkpoints_cache/CASIA2-Full-42.pt --image /path/to/image.png
 ```
 
 Optional CLI arguments:
